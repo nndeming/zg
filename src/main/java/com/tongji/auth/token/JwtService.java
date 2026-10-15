@@ -34,7 +34,7 @@ public class JwtService {
     private final JwtEncoder jwtEncoder;
     private final JwtDecoder jwtDecoder;
     private final AuthProperties properties;
-    private final Clock clock = Clock.systemUTC();
+    private final Clock clock = Clock.systemUTC();  // UTC: 世界标准时间
 
     /**
      * 为指定用户签发一对 Access/Refresh Token。
@@ -78,14 +78,14 @@ public class JwtService {
      */
     private String encodeToken(User user, Instant issuedAt, Instant expiresAt, String tokenType, String tokenId) {
         JwtClaimsSet claims = JwtClaimsSet.builder()
-                .issuer(properties.getJwt().getIssuer())
-                .issuedAt(issuedAt)
-                .expiresAt(expiresAt)
-                .subject(String.valueOf(user.getId()))
-                .id(tokenId)
-                .claim(CLAIM_TOKEN_TYPE, tokenType)
+                .issuer(properties.getJwt().getIssuer())        // 签发者
+                .issuedAt(issuedAt)                             // 签发时间
+                .expiresAt(expiresAt)                           // 过期时间
+                .subject(String.valueOf(user.getId()))          // 主体标识, 这个token代表谁
+                .id(tokenId)                                    // 令牌唯一id, 撤销令牌靠它
+                .claim(CLAIM_TOKEN_TYPE, tokenType)             // 自定义信息, 区分access和refresh
                 .claim(CLAIM_USER_ID, user.getId())
-                .claim("nickname", user.getNickname())
+                .claim("nickname", user.getNickname())   // 方便前端登陆成功后显示昵称, 免查库
                 .build();
         return jwtEncoder.encode(JwtEncoderParameters.from(claims)).getTokenValue();
     }

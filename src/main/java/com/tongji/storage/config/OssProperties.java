@@ -6,6 +6,8 @@ import org.springframework.stereotype.Component;
 
 @Data
 @Component
+// 这个注解使得当前配置类会自动去application.yml寻找相关配置
+// 寻找oss.*的相关配置
 @ConfigurationProperties(prefix = "oss")
 public class OssProperties {
     private String endpoint;

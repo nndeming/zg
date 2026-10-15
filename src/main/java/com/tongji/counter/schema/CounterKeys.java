@@ -19,4 +19,8 @@ public final class CounterKeys {
     public static String aggKey(String entityType, String entityId) {
         return String.format("agg:%s:%s:%s", CounterSchema.SCHEMA_ID, entityType, entityId); // 刷写前的增量存储桶
     }
+
+    // 聚合桶目录索引（Set）：元素为"有待刷写增量"的 aggKey。
+    // flush 只遍历这个集合，替代 KEYS 全库扫描，扫描量与 Redis 总 key 数解耦。
+    public static final String AGG_INDEX = "agg:index";
 }

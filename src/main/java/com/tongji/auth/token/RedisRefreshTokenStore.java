@@ -43,6 +43,9 @@ public class RedisRefreshTokenStore implements RefreshTokenStore {
      */
     @Override
     public boolean isTokenValid(long userId, String tokenId) {
+        // 为什么这里不判断刷新令牌有效期, 而是来看Redis
+        // 因为Redis中存储的才是真正的有效期, 每次登陆后都会换新的刷新令牌
+        // 如果拿着旧的刷新令牌呢? 因此只看Redis, Redis才是真正的当前有效刷新令牌
         String key = key(userId, tokenId);
         return Objects.equals("1", redisTemplate.opsForValue().get(key));
     }

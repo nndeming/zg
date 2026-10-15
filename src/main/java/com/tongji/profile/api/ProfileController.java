@@ -65,6 +65,7 @@ public class ProfileController {
     public ProfileResponse uploadAvatar(@AuthenticationPrincipal Jwt jwt,
                                         @RequestPart("file") MultipartFile file) {
         long userId = jwtService.extractUserId(jwt);
+        // 将头像上传到OSS, 并返回OSS提供的该头像URL
         String url = ossStorageService.uploadAvatar(userId, file);
 
         return profileService.updateAvatar(userId, url);

@@ -118,6 +118,7 @@ public class CounterServiceImpl implements CounterService {
         String bmKey = CounterKeys.bitmapKey(metric, etype, eid, chunk);
         List<String> keys = List.of(bmKey);
         List<String> args = List.of(String.valueOf(bit), add ? "add" : "remove");
+        // 走的是lua脚本模式
         Long changed = redis.execute(toggleScript, keys, args.toArray());
         boolean ok = changed == 1L;
         if (ok) {
@@ -136,10 +137,13 @@ public class CounterServiceImpl implements CounterService {
      */
     @Override
     public Map<String, Long> getCounts(String entityType, String entityId, List<String> metrics) {
+        // 生成查询Key
         String sdsKey = CounterKeys.sdsKey(entityType, entityId);
+        // 每个维度预留4字节, 总共5个维度
         int expectedLen = CounterSchema.SCHEMA_LEN * CounterSchema.FIELD_SIZE;
         // SDS 固定结构：按大端 32 位编码
         byte[] raw = getRaw(sdsKey);
+        // 是否需要重建
         boolean needRebuild = (raw == null || raw.length != expectedLen);
 
         Map<String, Long> result = new LinkedHashMap<>();
@@ -147,14 +151,19 @@ public class CounterServiceImpl implements CounterService {
         if (needRebuild) {
             log.info("计数结构不存在，需要重建");
             // 限流与指数退避：避免在热点实体上触发重建风暴
+
+            // 指数退避防的是重试风暴, 拉长重试间隔
             if (inBackoff(entityType, entityId)) {
+                // 处于指数退避期, 直接返回0
                 for (String m : metrics) {
                     result.put(m, 0L);
                 }
                 return result;
             }
 
+            // 限流防的是突发流量
             if (!allowedByRateLimiter(entityType, entityId)) {
+                // 被限流了, 增加退避等级
                 escalateBackoff(entityType, entityId);
                 for (String m : metrics) {
                     result.put(m, 0L);
@@ -171,6 +180,7 @@ public class CounterServiceImpl implements CounterService {
                 // 使用 Redisson 看门狗机制：不指定租期，自动续约（由 Redisson 的 lockWatchdogTimeout 控制）
                 locked = lock.tryLock(0L, TimeUnit.MILLISECONDS);
                 if (!locked) {
+                    // 未抢到分布式锁, 增加退避等级
                     escalateBackoff(entityType, entityId);
                     for (String m : metrics) {
                         result.put(m, 0L);
@@ -178,6 +188,7 @@ public class CounterServiceImpl implements CounterService {
                     return result;
                 }
                 // 依据位图分片统计真实计数（仅由持锁者执行重建）
+                // 这里重建的依据是标记一个视频特定用户是否点赞的位图信息
                 byte[] newSds = new byte[expectedLen];
                 List<String> rebuildFields = new ArrayList<>();
                 for (String m : metrics) {
@@ -193,11 +204,14 @@ public class CounterServiceImpl implements CounterService {
                 // 回写SDS并清理聚合桶，避免重复加算
                 setRaw(sdsKey, newSds);
                 if (!rebuildFields.isEmpty()) {
+                    // 聚合桶是Kafka聚合1s内的所有信息再增量写入, 如果此处全量重建了, 就要删掉聚合桶内的信息
                     String aggKey = CounterKeys.aggKey(entityType, entityId);
                     redis.opsForHash().delete(aggKey, rebuildFields.toArray());
                 }
+                // 重置退避状态
                 resetBackoff(entityType, entityId);
             } catch (InterruptedException ie) {
+                // 异常兜底
                 Thread.currentThread().interrupt();
                 escalateBackoff(entityType, entityId);
                 for (String m : metrics) {
@@ -316,6 +330,7 @@ public class CounterServiceImpl implements CounterService {
      * 读取 SDS 原始字节（固定结构，长度=字段数×4）。
      */
     private byte[] getRaw(String key) {
+        // 获取20个裸字节, 不通过redis.opsForValue().get(key), 否则会走UTF-8 -> String反序列化
         return redis.execute((RedisCallback<byte[]>) connection ->
                 connection.stringCommands().get(key.getBytes(StandardCharsets.UTF_8)));
     }
@@ -324,6 +339,7 @@ public class CounterServiceImpl implements CounterService {
      * 写入 SDS 原始字节（覆盖式写）。
      */
     private void setRaw(String key, byte[] val) {
+        // 裸写20个字节
         redis.execute((RedisCallback<Void>) connection -> {
             connection.stringCommands().set(key.getBytes(StandardCharsets.UTF_8), val);
             return null;
@@ -345,13 +361,20 @@ public class CounterServiceImpl implements CounterService {
      * 增加退避级别并设置下次允许尝试的时间（指数递增，封顶）。
      */
     private void escalateBackoff(String entityType, String entityId) {
+        // 映射关系:
+        // eKey -> expB -> exp : 存退避级别, 一个整数
+        // uKey -> utilB : 存解禁时间戳, 一个毫秒数
+
         String eKey = String.format("backoff:sds-rebuild:exp:%s:%s", entityType, entityId);
         String uKey = String.format("backoff:sds-rebuild:until:%s:%s", entityType, entityId);
 
         RBucket<Integer> expB = redisson.getBucket(eKey);
         RBucket<Long> untilB = redisson.getBucket(uKey);
+
+        // 指数退避级别
         Integer exp = expB.get();
 
+        // 获取下一个退避级别
         int nextExp = Math.min(exp == null ? 0 : exp + 1, 10);
         long delay = Math.min(backoffBaseMs * (1L << nextExp), backoffMaxMs);
         long until = System.currentTimeMillis() + delay;
@@ -362,7 +385,7 @@ public class CounterServiceImpl implements CounterService {
     }
 
     /**
-     * 重置退避状态（成功重建后）。
+     * 重置退避状态（成功重建后）, 删除这两个Key。
      */
     private void resetBackoff(String entityType, String entityId) {
         String eKey = String.format("backoff:sds-rebuild:exp:%s:%s", entityType, entityId);
@@ -385,6 +408,7 @@ public class CounterServiceImpl implements CounterService {
         RRateLimiter limiter = redisson.getRateLimiter(rlKey);
 
         // 初始化速率（如已存在则忽略）
+        // 限定10秒内3个请求, 等价于hsetnx(不存在才设置)
         limiter.trySetRate(RateType.OVERALL, ratePermits, Duration.ofSeconds(rateWindowSeconds));
 
         return limiter.tryAcquire(1);

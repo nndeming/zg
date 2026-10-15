@@ -75,7 +75,9 @@ public class AuthService {
      * @throws BusinessException 当标识格式错误或存在性不符合场景要求时抛出。
      */
     public SendCodeResponse sendCode(SendCodeRequest request) {
+        // 校验账号, 两类情形(手机号 or 邮箱)
         validateIdentifier(request.identifierType(), request.identifier());
+        // 标准化账号格式
         String normalized = normalizeIdentifier(request.identifierType(), request.identifier());
         boolean exists = identifierExists(request.identifierType(), normalized);
         if (request.scene() == VerificationScene.REGISTER && exists) {
@@ -124,7 +126,9 @@ public class AuthService {
         }
 
         userService.createUser(user);
+        // 签发Token对
         TokenPair tokenPair = jwtService.issueTokenPair(user);
+        // 将刷新令牌存储到redis当中, 有效期为7天
         storeRefreshToken(user.getId(), tokenPair);
         loginLogService.record(user.getId(), identifier, "REGISTER", clientInfo.ip(), clientInfo.userAgent(), "SUCCESS");
 
@@ -162,7 +166,9 @@ public class AuthService {
         } else {
             throw new BusinessException(ErrorCode.BAD_REQUEST, "请提供验证码或密码");
         }
+        // 签发Token对
         TokenPair tokenPair = jwtService.issueTokenPair(user);
+        // 将刷新令牌存储到redis当中, 有效期为7天
         storeRefreshToken(user.getId(), tokenPair);
         loginLogService.record(user.getId(), identifier, channel, clientInfo.ip(), clientInfo.userAgent(), "SUCCESS");
         return new AuthResponse(mapUser(user), mapToken(tokenPair));
@@ -193,6 +199,7 @@ public class AuthService {
 
         User user = findUserById(userId).orElseThrow(() -> new BusinessException(ErrorCode.IDENTIFIER_NOT_FOUND));
         TokenPair tokenPair = jwtService.issueTokenPair(user);
+        // 签发新令牌后撤销旧刷新令牌并存储新令牌
         refreshTokenStore.revokeToken(userId, tokenId);
         storeRefreshToken(userId, tokenPair);
 
@@ -209,6 +216,7 @@ public class AuthService {
             if (Objects.equals("refresh", jwtService.extractTokenType(jwt))) {
                 long userId = jwtService.extractUserId(jwt);
                 String tokenId = jwtService.extractTokenId(jwt);
+                // 撤销指定刷新令牌（从白名单移除）
                 refreshTokenStore.revokeToken(userId, tokenId);
             }
         });
@@ -352,6 +360,8 @@ public class AuthService {
     private String normalizeIdentifier(IdentifierType type, String identifier) {
         return switch (type) {
             case PHONE -> identifier.trim();
+            // Locale.ROOT: 不使用任何本地化语言规则, 只按 Unicode 基础字符规则转换。
+            // 避免不同国家语言转换出现问题
             case EMAIL -> identifier.trim().toLowerCase(Locale.ROOT);
         };
     }

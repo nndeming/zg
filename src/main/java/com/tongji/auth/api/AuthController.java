@@ -38,7 +38,7 @@ import org.springframework.web.bind.annotation.RestController;
 @RequiredArgsConstructor
 @Validated
 public class AuthController {
-
+    // 通过@RequiredArgsConstructor实现构造函数注入
     private final AuthService authService;
     private final JwtService jwtService;
 

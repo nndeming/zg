@@ -49,10 +49,16 @@ public class VerificationService {
             throw new BusinessException(ErrorCode.BAD_REQUEST, "请提供正确的验证码发送参数");
         }
         AuthProperties.Verification cfg = properties.getVerification();
+        // 记录验证码发送间隔
+        // key = "auth:code:last:" + scene.name() + ":" + identifier;
         enforceSendInterval(scene, identifier, cfg.getSendInterval());
+        // 记录验证码发送次数是否达到每日上限
+        // key = "auth:code:count:" + scene.name() + ":" + identifier + ":" + date;
         enforceDailyLimit(scene, identifier, cfg.getDailyLimit());
 
         String code = generateNumericCode(cfg.getCodeLength());
+        // 通过Redis的Hash结构记录验证码信息, 包括验证码取值, 最大尝试次数, 已尝试次数
+        // key = "auth:code:%s:%s".formatted(scene, identifier)
         codeStore.saveCode(scene.name(), identifier, code, cfg.getTtl(), cfg.getMaxAttempts());
         codeSender.sendCode(scene, identifier, code, (int) cfg.getTtl().toMinutes());
         return new SendCodeResult(identifier, scene, (int) cfg.getTtl().toSeconds());

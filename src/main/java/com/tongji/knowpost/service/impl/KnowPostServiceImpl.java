@@ -24,8 +24,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.scheduling.TaskScheduler;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -54,9 +57,11 @@ public class KnowPostServiceImpl implements KnowPostService {
     private final HotKeyDetector hotKey;
     private static final Logger log = LoggerFactory.getLogger(KnowPostServiceImpl.class);
     private static final int DETAIL_LAYOUT_VER = 1;
+    private static final long INVALIDATE_DELAY_MS = 500;
     private final ConcurrentHashMap<String, Object> singleFlight = new ConcurrentHashMap<>();
     private final RagIndexService ragIndexService;
     private final OutboxMapper outboxMapper;
+    private final TaskScheduler cacheInvalidateScheduler;
 
     // 手动编写构造器，Spring的@Qualifier直接标注在参数上（核心）
     public KnowPostServiceImpl(
@@ -71,7 +76,8 @@ public class KnowPostServiceImpl implements KnowPostService {
             @Qualifier("knowPostDetailCache") Cache<String, KnowPostDetailResponse> knowPostDetailCache,
             HotKeyDetector hotKey,
             RagIndexService ragIndexService,
-            OutboxMapper outboxMapper
+            OutboxMapper outboxMapper,
+            @Qualifier("cacheInvalidateScheduler") TaskScheduler cacheInvalidateScheduler
     ) {
         this.mapper = mapper;
         this.idGen = idGen;
@@ -85,14 +91,19 @@ public class KnowPostServiceImpl implements KnowPostService {
         this.hotKey = hotKey;
         this.ragIndexService = ragIndexService;
         this.outboxMapper = outboxMapper;
+        this.cacheInvalidateScheduler = cacheInvalidateScheduler;
     }
     /**
      * 创建草稿并返回新 ID。
+     * 注意此处加入了事务
      */
     @Transactional
     public long createDraft(long creatorId) {
+        // 生成ID
         long id = idGen.nextId();
+        // 获取当前时间
         Instant now = Instant.now();
+        // 构建存储记录
         KnowPost post = KnowPost.builder()
                 .id(id)
                 .creatorId(creatorId)
@@ -103,6 +114,7 @@ public class KnowPostServiceImpl implements KnowPostService {
                 .createTime(now)
                 .updateTime(now)
                 .build();
+        // 插入数据库
         mapper.insertDraft(post);
         return id;
     }
@@ -112,16 +124,15 @@ public class KnowPostServiceImpl implements KnowPostService {
      */
     @Transactional
     public void confirmContent(long creatorId, long id, String objectKey, String etag, Long size, String sha256) {
-        // 缓存双删
-        invalidateCache(id);
+        invalidateCache(id); // 延迟双删第一刀：更新前清旧值
 
         KnowPost post = KnowPost.builder()
                 .id(id)
                 .creatorId(creatorId)
                 .contentObjectKey(objectKey)
-                .contentEtag(etag)
-                .contentSize(size)
-                .contentSha256(sha256)
+                .contentEtag(etag)  // etag是前端直接调用OSS得到的返回值
+                .contentSize(size)  // 前端本地计算
+                .contentSha256(sha256)  // 前端本地计算
                 .contentUrl(publicUrl(objectKey))
                 .updateTime(Instant.now())
                 .build();
@@ -131,7 +142,7 @@ public class KnowPostServiceImpl implements KnowPostService {
             throw new BusinessException(ErrorCode.BAD_REQUEST, "草稿不存在或无权限");
         }
 
-        invalidateCache(id);
+        scheduleDelayedInvalidate(id); // 提交后延迟 500ms 清理缓存（覆盖并发回填旧值的窗口）
 
         // 触发一次预索引（草稿阶段可能因可见性/状态被跳过）
         try {
@@ -143,10 +154,11 @@ public class KnowPostServiceImpl implements KnowPostService {
 
     /**
      * 更新元数据：标题、标签、可见性、置顶、图片列表等。
+     * 注意此处带有事务
      */
     @Transactional
     public void updateMetadata(long creatorId, long id, String title, Long tagId, List<String> tags, List<String> imgUrls, String visible, Boolean isTop, String description) {
-        invalidateCache(id);
+        invalidateCache(id); // 延迟双删第一刀：更新前清旧值
 
         KnowPost post = KnowPost.builder()
                 .id(id)
@@ -177,7 +189,7 @@ public class KnowPostServiceImpl implements KnowPostService {
             log.warn("Outbox event after metadata update failed, post {}: {}", id, e.getMessage());
         }
 
-        invalidateCache(id);
+        scheduleDelayedInvalidate(id); // 提交后延迟 500ms 清理缓存（覆盖并发回填旧值的窗口）
     }
 
     /**
@@ -185,6 +197,8 @@ public class KnowPostServiceImpl implements KnowPostService {
      */
     @Transactional
     public void publish(long creatorId, long id) {
+        invalidateCache(id); // 延迟双删第一刀：更新前清旧值
+
         int updated = mapper.publish(id, creatorId);
 
         if (updated == 0) {
@@ -209,6 +223,9 @@ public class KnowPostServiceImpl implements KnowPostService {
         } catch (Exception e) {
             log.warn("Pre-index after publish failed, post {}: {}", id, e.getMessage());
         }
+
+        // 发布改变 status/publishTime，使详情与 Feed 缓存失效（提交后延迟 500ms 清理）
+        scheduleDelayedInvalidate(id);
     }
 
     /**
@@ -216,7 +233,7 @@ public class KnowPostServiceImpl implements KnowPostService {
      */
     @Transactional
     public void updateTop(long creatorId, long id, boolean isTop) {
-        invalidateCache(id);
+        invalidateCache(id); // 延迟双删第一刀：更新前清旧值
 
         int updated = mapper.updateTop(id, creatorId, isTop);
 
@@ -224,7 +241,7 @@ public class KnowPostServiceImpl implements KnowPostService {
             throw new BusinessException(ErrorCode.BAD_REQUEST, "草稿不存在或无权限");
         }
 
-        invalidateCache(id);
+        scheduleDelayedInvalidate(id); // 提交后延迟 500ms 清理缓存（覆盖并发回填旧值的窗口）
     }
 
     /**
@@ -236,7 +253,7 @@ public class KnowPostServiceImpl implements KnowPostService {
             throw new BusinessException(ErrorCode.BAD_REQUEST, "可见性取值非法");
         }
 
-        invalidateCache(id);
+        invalidateCache(id); // 延迟双删第一刀：更新前清旧值
 
         int updated = mapper.updateVisibility(id, creatorId, visible);
 
@@ -244,7 +261,7 @@ public class KnowPostServiceImpl implements KnowPostService {
             throw new BusinessException(ErrorCode.BAD_REQUEST, "草稿不存在或无权限");
         }
 
-        invalidateCache(id);
+        scheduleDelayedInvalidate(id); // 提交后延迟 500ms 清理缓存（覆盖并发回填旧值的窗口）
     }
 
     /**
@@ -252,7 +269,7 @@ public class KnowPostServiceImpl implements KnowPostService {
      */
     @Transactional
     public void delete(long creatorId, long id) {
-        invalidateCache(id);
+        invalidateCache(id); // 延迟双删第一刀：更新前清旧值
 
         int updated = mapper.softDelete(id, creatorId);
         if (updated == 0) {
@@ -268,7 +285,7 @@ public class KnowPostServiceImpl implements KnowPostService {
             log.warn("Outbox event after delete failed, post {}: {}", id, e.getMessage());
         }
 
-        invalidateCache(id);
+        scheduleDelayedInvalidate(id); // 提交后延迟 500ms 清理缓存（覆盖并发回填旧值的窗口）
     }
 
     private boolean isValidVisible(String visible) {
@@ -335,6 +352,7 @@ public class KnowPostServiceImpl implements KnowPostService {
             return enrichDetailResponse(local, currentUserIdNullable, true);
         }
 
+        // 从Redis获取缓存
         String cached = redis.opsForValue().get(pageKey);
 
         // 2. 第一次尝试处理缓存命中
@@ -456,6 +474,7 @@ public class KnowPostServiceImpl implements KnowPostService {
         }
         
         // 2. 命中空值缓存（防止穿透）
+        // 此处异常会被GlobalExceptionHandler接收和处理
         if ("NULL".equals(cached)) {
             throw new BusinessException(ErrorCode.BAD_REQUEST, "内容不存在");
         }
@@ -489,7 +508,9 @@ public class KnowPostServiceImpl implements KnowPostService {
      * @return 叠加了最新状态的响应对象
      */
     private KnowPostDetailResponse enrichDetailResponse(KnowPostDetailResponse base, Long uid, boolean refreshCounts) {
+        // 点赞数
         Long likeCount = base.likeCount();
+        // 收藏数
         Long favoriteCount = base.favoriteCount();
 
         // 1. 刷新计数（仅在走缓存时执行）
@@ -561,16 +582,52 @@ public class KnowPostServiceImpl implements KnowPostService {
         }
     }
 
+    /**
+     * 延迟双删的第二刀：事务提交后，以提交时刻为起点延迟 500ms 删除缓存。
+     *
+     * <p>整体策略：第一刀（方法开头的 {@code invalidateCache}）清除更新前驻留的旧值；
+     * 第二刀清除更新期间被并发读回填的旧值——这类请求在提交前查库、在提交后写缓存，
+     * 其回填必在提交后 500ms 内完成，因此以提交时刻为起点延迟 500ms 一刀即可覆盖全部竞态窗口。</p>
+     *
+     * <p>必须注册在 afterCommit 中——若改为方法开头调度固定时延，慢事务会让删除落在提交之前。</p>
+     *
+     * <p>提交后至任务执行前约有 500ms 可感知陈旧窗口；任务丢失有 TTL 兜底。</p>
+     *
+     * @param id 知文 ID
+     */
+    private void scheduleDelayedInvalidate(long id) {
+        Runnable task = () -> cacheInvalidateScheduler.schedule(
+                () -> invalidateCache(id),
+                Instant.now().plusMillis(INVALIDATE_DELAY_MS));
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    task.run();
+                }
+            });
+        } else {
+            task.run();
+        }
+    }
+
+    /**
+     * 删除 本地 + Redis 缓存
+     * @param id    知文ID
+     */
     private void invalidateCache(long id) {
+        // 构造缓存Key, 此处不是用于缓存, 是用于删除缓存
         String pageKey = "knowpost:detail:" + id + ":v" + DETAIL_LAYOUT_VER;
 
         try {
+            // 删除Redis缓存
             redis.delete(pageKey);
         } catch (Exception e) {
             log.warn("Redis 详情缓存删除失败，key={}", pageKey, e);
         }
 
         try {
+            // 删除本地缓存
             knowPostDetailCache.invalidate(pageKey);
         } catch (Exception e) {
             log.warn("本地详情缓存删除失败，key={}", pageKey, e);
@@ -583,11 +640,26 @@ public class KnowPostServiceImpl implements KnowPostService {
         }
     }
 
+    /**
+     * 清理 Feed 缓存中引用了该知文的本地缓存页。
+     *
+     * <p>Feed 页的本地缓存（Caffeine）按"页码"缓存，一页含 20 篇知文，无法直接从知文 ID
+     * 反推它落在哪些缓存页里，因此写路径（FeedService 回源时）会维护一个反向索引：
+     * {@code feed:public:index:{知文ID}:{小时槽}} -> 该知文出现过的缓存页 key 集合。
+     * 本方法通过该索引找到相关缓存页并逐页失效。</p>
+     *
+     * <p>查当前和上一小时两个槽位：缓存页可能是在上一个小时内生成、且 TTL 尚未过期。</p>
+     *
+     * @param id 知文 ID
+     */
     private void invalidateFeedLocalCache(long id) {
+        // 当前小时槽；索引按小时分槽是为了让 Set 自动过期，避免索引无限增长
         long hourSlot = System.currentTimeMillis() / 3600000L;
+        // 同时清理当前小时和上一小时，覆盖跨小时生成的缓存页
         for (long slot : List.of(hourSlot, hourSlot - 1)) {
             String indexKey = "feed:public:index:" + id + ":" + slot;
             try {
+                // 反查：该知文出现在哪些缓存页中
                 Set<String> pageKeys = redis.opsForSet().members(indexKey);
                 if (pageKeys == null || pageKeys.isEmpty()) {
                     continue;
@@ -596,10 +668,12 @@ public class KnowPostServiceImpl implements KnowPostService {
                     if (localPageKey == null || localPageKey.isBlank()) {
                         continue;
                     }
+                    // 逐个失效本地缓存页，并从索引中移除（防止同一页被重复清理）
                     feedPublicCache.invalidate(localPageKey);
                     redis.opsForSet().remove(indexKey, localPageKey);
                 }
             } catch (Exception e) {
+                // 清理失败不阻断主流程；残留的本地缓存页会靠 TTL 自然过期
                 log.warn("Feed 缓存清理异常，indexKey={}", indexKey, e);
             }
         }

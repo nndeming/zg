@@ -22,7 +22,9 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.data.redis.core.SetOperations;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
+import org.springframework.scheduling.TaskScheduler;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Set;
 
@@ -57,6 +59,8 @@ class KnowPostServiceImplTest {
     private RagIndexService ragIndexService;
     @Mock
     private OutboxMapper outboxMapper;
+    @Mock
+    private TaskScheduler cacheInvalidateScheduler;
 
     private Cache<String, FeedPageResponse> feedPublicCache;
     private Cache<String, KnowPostDetailResponse> knowPostDetailCache;
@@ -68,6 +72,12 @@ class KnowPostServiceImplTest {
         knowPostDetailCache = Caffeine.newBuilder().build();
 
         when(redis.opsForSet()).thenReturn(setOperations);
+        // 缓存删除只发生在调度器里：被调度时立即执行，模拟延迟任务到点运行
+        lenient().when(cacheInvalidateScheduler.schedule(any(Runnable.class), any(Instant.class)))
+                .thenAnswer(invocation -> {
+                    invocation.<Runnable>getArgument(0).run();
+                    return null;
+                });
 
         CacheProperties cacheProperties = new CacheProperties();
         HotKeyDetector hotKeyDetector = new HotKeyDetector(cacheProperties);
@@ -85,7 +95,8 @@ class KnowPostServiceImplTest {
                 knowPostDetailCache,
                 hotKeyDetector,
                 ragIndexService,
-                outboxMapper
+                outboxMapper,
+                cacheInvalidateScheduler
         );
 
     }

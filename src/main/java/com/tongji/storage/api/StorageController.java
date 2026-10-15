@@ -67,6 +67,7 @@ public class StorageController {
         }
 
         int expiresIn = 600; // 10 分钟
+        // 生成预签名链接
         String putUrl = ossStorageService.generatePresignedPutUrl(objectKey, request.contentType(), expiresIn);
         Map<String, String> headers = Map.of("Content-Type", request.contentType());
         return new StoragePresignResponse(objectKey, putUrl, headers, expiresIn);

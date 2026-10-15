@@ -6,6 +6,7 @@ import com.tongji.knowpost.api.dto.FeedPageResponse;
 import com.tongji.knowpost.api.dto.KnowPostDetailResponse;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
 
 import java.time.Duration;
 
@@ -53,5 +54,21 @@ public class CacheConfig {
                 .maximumSize(props.getL2().getDetailCfg().getMaxSize())
                 .expireAfterWrite(Duration.ofSeconds(props.getL2().getDetailCfg().getTtlSeconds()))
                 .build();
+    }
+
+    /**
+     * 缓存延迟双删的调度器。
+     *
+     * <p>用于在事务提交后延迟执行第二次缓存删除，覆盖并发读回填旧值的窗口；
+     * 任务丢失有 TTL 兜底，不保证送达。</p>
+     */
+    @Bean("cacheInvalidateScheduler")
+    public ThreadPoolTaskScheduler cacheInvalidateScheduler() {
+        ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
+        scheduler.setPoolSize(2);
+        scheduler.setThreadNamePrefix("cache-invalidate-");
+        scheduler.setRemoveOnCancelPolicy(true);
+        scheduler.initialize();
+        return scheduler;
     }
 }
