@@ -37,3 +37,5 @@ build/
 
 ### Mac OS ###
 .DS_Store
+# JWT 密钥对（本地生成，勿提交）
+src/main/resources/keys/
