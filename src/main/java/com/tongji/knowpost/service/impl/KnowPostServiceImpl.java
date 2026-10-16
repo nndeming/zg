@@ -441,7 +441,8 @@ public class KnowPostServiceImpl implements KnowPostService {
                 // 增加随机抖动（Jitter），防止大量缓存同时过期（雪崩）
                 int jitter = ThreadLocalRandom.current().nextInt(30);
                 // 根据热度检测结果动态调整 TTL，热点内容缓存时间更长
-                int target = hotKey.ttlForPublic(baseTtl, pageKey);
+                // 注意：热度统一登记在 knowpost:{id} 下，此处必须用同一 key 查询，否则永远查不到热度
+                int target = hotKey.ttlForPublic(baseTtl, "knowpost:" + id);
                 redis.opsForValue().set(pageKey, json, Duration.ofSeconds(Math.max(target, baseTtl + jitter)));
 
                 // L1 填充

@@ -72,7 +72,7 @@ canal:
   destination: example
   username: "canal"
   password: "Canal@123456"
-  filter: zhiguang\.outbox
+  filter: zhiguang\.outbox  # 只订阅outbox表
   batchSize: 1000
   intervalMs: 1000
 
@@ -142,3 +142,5 @@ cache:
     extend-low-seconds: 20
     extend-medium-seconds: 60
     extend-high-seconds: 120
+    max-keys: 10000            # 热度计数表上限，超出按 Caffeine 策略逐出，防内存泄漏
+    expire-after-access-seconds: 600  # 热度条目空闲过期，长期无访问自动清理

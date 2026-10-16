@@ -83,5 +83,11 @@ public class CacheProperties {
 
         // 高热度额外延长 TTL（秒）。
         private int extendHighSeconds = 120;
+
+        // 热度计数表的最大 key 数：超过后按 Caffeine 策略逐出，防止内存无限增长。
+        private long maxKeys = 10_000;
+
+        // 热度条目空闲过期（秒）：长时间无访问的 key 自动逐出。
+        private int expireAfterAccessSeconds = 600;
     }
 }

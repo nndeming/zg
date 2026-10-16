@@ -1,12 +1,13 @@
 package com.tongji.cache.hotkey;
 
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import com.tongji.cache.config.CacheProperties;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
+import java.time.Duration;
 import java.util.Arrays;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -19,9 +20,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * - 根据总热度 h=Σ段计数，映射到 NONE/LOW/MEDIUM/HIGH 的热度等级；
  * - 提供 ttlForPublic/ttlForMine：在基准 TTL 上叠加等级扩展秒数，保护热点请求。
  * <p>
- * 并发语义：
- * - 使用 ConcurrentHashMap 存储计数数组，AtomicInteger 维护段游标；
- * - 计数递增为无锁数组操作，rotate 仅清零新段，避免大范围写冲突；
+ * 并发与容量语义：
+ * - 计数表使用 Caffeine 有界缓存（maximumSize + expireAfterAccess）：key 数量封顶，
+ *   长期无访问的 key 自动逐出，避免热度条目无限增长导致内存泄漏；
+ * - 计数递增为无锁数组操作（Caffeine 按 key 原子建组），rotate 仅清零新段，避免大范围写冲突；
  * - 统计为近似滑窗，保证在高并发下的稳定与低开销。
  */
 @Component
@@ -30,15 +32,15 @@ public class HotKeyDetector {
 
     /** 缓存配置（包含窗口/分段参数、等级阈值、扩展秒数） */
     private final CacheProperties properties;
-    /** 每个 key 的滑窗分段计数数组，长度为 segments */
-    private final Map<String, int[]> counters = new ConcurrentHashMap<>();
+    /** 每个 key 的滑窗分段计数数组（Caffeine 有界缓存，超长闲置自动逐出），长度为 segments */
+    private final Cache<String, int[]> counters;
     /** 当前活跃分段索引（原子维护） */
     private final AtomicInteger current = new AtomicInteger(0);
     /** 滑窗分段数量：windowSeconds / segmentSeconds */
     private final int segments;
 
     /**
-     * 初始化探测器：根据配置计算分段数量。
+     * 初始化探测器：根据配置计算分段数量并构建有界计数表。
      * @param properties 缓存配置（hotkey）
      */
     public HotKeyDetector(CacheProperties properties) {
@@ -46,6 +48,10 @@ public class HotKeyDetector {
         int segSeconds = properties.getHotkey().getSegmentSeconds();
         int winSeconds = properties.getHotkey().getWindowSeconds();
         this.segments = Math.max(1, winSeconds / Math.max(1, segSeconds));
+        this.counters = Caffeine.newBuilder()
+                .maximumSize(properties.getHotkey().getMaxKeys())
+                .expireAfterAccess(Duration.ofSeconds(properties.getHotkey().getExpireAfterAccessSeconds()))
+                .build();
     }
 
     /**
@@ -53,7 +59,8 @@ public class HotKeyDetector {
      * @param key 缓存键
      */
     public void record(String key) {
-        int[] arr = counters.computeIfAbsent(key, k -> new int[segments]);
+        // Caffeine保证这个操作的原子性
+        int[] arr = counters.get(key, k -> new int[segments]);
         arr[current.get()]++;
     }
 
@@ -63,11 +70,11 @@ public class HotKeyDetector {
      * @return 热度值
      */
     public int heat(String key) {
-        int[] arr = counters.get(key);
+        int[] arr = counters.getIfPresent(key);
         if (arr == null) {
             return 0;
         }
-
+        // 统计这一分钟内该Key的访问次数
         int sum = 0;
         for (int v : arr) {
             sum += v;
@@ -82,6 +89,7 @@ public class HotKeyDetector {
      * @return 热度等级
      */
     public Level level(String key) {
+        // 获取一分钟内该key的访问次数
         int h = heat(key);
         if (h >= properties.getHotkey().getLevelHigh()) {
             return Level.HIGH;
@@ -103,6 +111,7 @@ public class HotKeyDetector {
      * @return 动态 TTL 秒数
      */
     public int ttlForPublic(int baseTtlSeconds, String key) {
+        // 获取热度等级
         Level l = level(key);
         return baseTtlSeconds + extendSeconds(l);
     }
@@ -139,8 +148,10 @@ public class HotKeyDetector {
     @Scheduled(fixedRateString = "${cache.hotkey.segment-seconds:10}000")
     public void rotate() {
         int next = (current.get() + 1) % segments;
+        // 此处set就是给current赋值
+        // 同时@Scheduled默认单线程, 因此不存在并发安全问题
         current.set(next);
-        for (int[] arr : counters.values()) {
+        for (int[] arr : counters.asMap().values()) {
             arr[next] = 0;
         }
     }
@@ -151,8 +162,7 @@ public class HotKeyDetector {
      * @param key 缓存键
      */
     public void reset(String key) {
-        int[] arr = counters.get(key);
+        int[] arr = counters.getIfPresent(key);
         if (arr != null) Arrays.fill(arr, 0);
     }
 }
-
