@@ -35,6 +35,7 @@ public class CounterRebuildConsumer {
     @KafkaListener(
             topics = CounterTopics.EVENTS,
             groupId = "counter-rebuild",
+            // 把事件 topic 保留期内的全部历史完整重放
             properties = {"auto.offset.reset=earliest"}
     )
     public void onMessage(String message, Acknowledgment ack) throws Exception {

@@ -80,11 +80,18 @@ public class CounterAggregationConsumer {
         // merged 的结构：聚合桶 key -> (指标 idx -> 净增量)
         // 外层按实体分桶，内层按指标合并：同一批里同一 (实体, 指标) 的所有事件先加减抵消，
         // 最终每个 (实体, 指标) 只产生一次 HINCRBY
+
+        // merged是聚合结果
+        // key: CounterKeys.aggKey()生成的字符串, 类似于 agg:v1:knowpost:12345
+        // value: key -> 指标下标; value -> 本批净增量
         Map<String, Map<Integer, Long>> merged = new HashMap<>();
+
         int discarded = 0;
         for (var record : records) {
+            // 遍历每一条消息
             CounterEvent evt;
             try {
+                // 转为CounterEvent类对象
                 evt = objectMapper.readValue(record.value(), CounterEvent.class);
             } catch (Exception ex) {
                 // 解析失败：跳过该条，避免毒消息阻塞整批重试
