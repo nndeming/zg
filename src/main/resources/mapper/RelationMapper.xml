@@ -11,14 +11,20 @@
         WHERE from_user_id=#{fromUserId} AND to_user_id=#{toUserId}
     </update>
 
+    <!-- INSERT IGNORE：依赖 uk(to_user_id, from_user_id) 幂等，重复事件重放返回 0 而非抛唯一键冲突 -->
     <insert id="insertFollower">
-        INSERT INTO follower (id, to_user_id, from_user_id, rel_status, created_at, updated_at)
+        INSERT IGNORE INTO follower (id, to_user_id, from_user_id, rel_status, created_at, updated_at)
         VALUES (#{id}, #{toUserId}, #{fromUserId}, #{relStatus}, NOW(3), NOW(3))
-        ON DUPLICATE KEY UPDATE rel_status=VALUES(rel_status), updated_at=VALUES(updated_at)
     </insert>
+    <!-- rel_status=0 守卫：仅“激活 -> 取消”计入影响行数，重复取消/重放返回 0 -->
     <update id="cancelFollower">
         UPDATE follower SET rel_status=0, updated_at=NOW(3)
-        WHERE to_user_id=#{toUserId} AND from_user_id=#{fromUserId}
+        WHERE to_user_id=#{toUserId} AND from_user_id=#{fromUserId} AND rel_status=1
+    </update>
+    <!-- 重新激活已存在但失效的关系；返回 1 表示本次发生激活迁移，0 表示不存在或已激活 -->
+    <update id="reactivateFollower">
+        UPDATE follower SET rel_status=1, updated_at=NOW(3)
+        WHERE to_user_id=#{toUserId} AND from_user_id=#{fromUserId} AND rel_status=0
     </update>
 
     <select id="existsFollowing" resultType="int">

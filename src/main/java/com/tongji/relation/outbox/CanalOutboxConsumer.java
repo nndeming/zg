@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tongji.relation.event.RelationEvent;
 import com.tongji.relation.processor.RelationEventProcessor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.stereotype.Service;
@@ -17,6 +19,7 @@ import com.tongji.common.util.OutboxMessageUtil;
  */
 @Service
 public class CanalOutboxConsumer {
+    private static final Logger log = LoggerFactory.getLogger(CanalOutboxConsumer.class);
     private final ObjectMapper objectMapper;
     private final RelationEventProcessor processor;
 
@@ -49,11 +52,15 @@ public class CanalOutboxConsumer {
                 if (payloadNode == null) {
                     continue;
                 }
-                
+
+                // 反序列化为RelationEvent类
                 RelationEvent evt = objectMapper.readValue(payloadNode.asText(), RelationEvent.class);
                 processor.process(evt);
             }
             ack.acknowledge();
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            // 不提交位点以便 Kafka 重放；仅记录日志，处理逻辑幂等可安全重试
+            log.error("Outbox 消息处理失败，等待重放: {}", message, e);
+        }
     }
 }

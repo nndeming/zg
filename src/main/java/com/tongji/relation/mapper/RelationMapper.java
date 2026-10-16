@@ -36,12 +36,13 @@ public interface RelationMapper {
                         @Param("toUserId") Long toUserId);
 
     /**
-     * 插入粉丝关系。
+     * 插入粉丝关系（幂等）。
+     * 依赖 uk(to_user_id, from_user_id) 唯一索引：已存在时静默忽略，供 Kafka 重复投递/重放安全调用。
      * @param id 主键ID
      * @param toUserId 被关注者
      * @param fromUserId 关注者
      * @param relStatus 关系状态
-     * @return 影响行数
+     * @return 1=本次新插入；0=记录已存在（被忽略）
      */
     int insertFollower(@Param("id") Long id,
                         @Param("toUserId") Long toUserId,
@@ -49,13 +50,22 @@ public interface RelationMapper {
                         @Param("relStatus") Integer relStatus);
 
     /**
-     * 取消粉丝关系（逻辑更新）。
+     * 取消粉丝关系（仅激活 -> 取消计入影响行数，幂等）。
      * @param toUserId 被关注者
      * @param fromUserId 关注者
-     * @return 影响行数
+     * @return 1=本次真正取消；0=无激活关系（重复取消或重放）
      */
     int cancelFollower(@Param("toUserId") Long toUserId,
                        @Param("fromUserId") Long fromUserId);
+
+    /**
+     * 重新激活已存在但失效的粉丝关系（取消后再次关注）。
+     * @param toUserId 被关注者
+     * @param fromUserId 关注者
+     * @return 1=本次发生激活迁移；0=记录不存在或已激活
+     */
+    int reactivateFollower(@Param("toUserId") Long toUserId,
+                           @Param("fromUserId") Long fromUserId);
 
     /**
      * 判断是否存在关注关系。
