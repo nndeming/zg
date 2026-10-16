@@ -28,6 +28,8 @@ import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import java.nio.charset.StandardCharsets;
 import org.springframework.data.redis.core.RedisCallback;
+import com.tongji.counter.schema.UserCounterKeys;
+import com.tongji.counter.schema.UserCounterSchema;
 
 /**
  * 关系服务实现。
@@ -80,11 +82,15 @@ public class RelationServiceImpl implements RelationService {
      * @return 是否关注成功
      */
     @Override
+    // 注意此处的事务
     @Transactional
     public boolean follow(long fromUserId, long toUserId) {
-        // Lua 脚本令牌桶限流
+        // Lua 脚本令牌桶限流(Hash结构)
+        // key: rl:follow:{fromUserId}
+        // 总共100个令牌, 每秒补充1个
         Long ok = redis.execute(tokenScript, List.of("rl:follow:" + fromUserId), "100", "1");
         if (ok == 0L) {
+            // 获取令牌失败, 被限流了
             return false;
         }
 
@@ -94,7 +100,9 @@ public class RelationServiceImpl implements RelationService {
         if (inserted > 0) {
             try {
                 Long outId = ThreadLocalRandom.current().nextLong(Long.MAX_VALUE);
+                // 序列化
                 String payload = objectMapper.writeValueAsString(new RelationEvent("FollowCreated", fromUserId, toUserId, id));
+                // 写入到outBox表, 此处是异步写缓存
                 outboxMapper.insert(outId, "following", id, "FollowCreated", payload);
             } catch (Exception ignored) {}
 
@@ -144,6 +152,7 @@ public class RelationServiceImpl implements RelationService {
      */
     @Override
     public List<Long> following(long userId, int limit, int offset) {
+        // uf: user follow
         String key = "uf:flws:" + userId;
         return getListWithOffset(
                 key,
@@ -269,29 +278,36 @@ public class RelationServiceImpl implements RelationService {
     }
 
     /**
-     * 判断是否为大V（基于 followers 计数阈值）。
+     * 判断是否为大V(基于 followers 计数阈值)
+     * 判断标准是粉丝数 >= 50w
      * @param userId 用户ID
      * @return 是否为大V
      */
     private boolean isBigV(long userId) {
-        byte[] raw = redis.execute((RedisCallback<byte[]>) c -> c.stringCommands().get(("ucnt:" + userId).getBytes(StandardCharsets.UTF_8)));
+        byte[] raw = redis.execute((RedisCallback<byte[]>) c -> c.stringCommands().get(
+                UserCounterKeys.sdsKey(userId).getBytes(StandardCharsets.UTF_8)));
 
-        if (raw == null || raw.length < 20) {
+        if (raw == null || raw.length < UserCounterSchema.SCHEMA_LEN * UserCounterSchema.FIELD_SIZE) {
             return false;
         }
 
-        long n = 0;
-        int off = 2 * 4;
-
-        for (int i = 0; i < 4; i++) {
-            n = (n << 8) | (raw[off + i] & 0xFFL);
-        }
+        // 0 基槽位读取：followers 槽的偏移 = IDX_FOLLOWERS × 4
+        long n = UserCounterSchema.read32be(raw, UserCounterSchema.IDX_FOLLOWERS);
 
         return n >= 500_000L;
     }
 
     /**
      * 偏移分页读取：优先命中 ZSet，未命中时从 DB 回填并设置 TTL；大V用户维护本地 Top 缓存以降低冷启动开销。
+     * @param key Redis查询所使用的Key
+     * @param offset 偏移分页, 从第几名开始
+     * @param limit 每页取几条
+     * @param rowsFetcher DB查询函数, 函数式接口
+     * @param idField 行数据里哪个字段是目标用户ID
+     * @param tsField 哪个字段做分数
+     * @param localCache L1 Caffeine 缓存
+     * @param userId 用于 L1 的 key，以及判断"是否大V"
+     * @return 期望的用户ID列表(可能是关注列表, 可能是粉丝列表)
      */
     private List<Long> getListWithOffset(
             String key,
@@ -325,6 +341,7 @@ public class RelationServiceImpl implements RelationService {
         Map<Long, Map<String, Object>> rows = rowsFetcher.apply(Math.min(need, 1000));
         if (rows != null && !rows.isEmpty()) {
             fillZSet(key, rows, idField, tsField, null);
+            // 设置过期时间为2h
             redis.expire(key, Duration.ofHours(2));
 
             // 回填后尝试更新本地缓存（仅针对大V）
@@ -376,10 +393,14 @@ public class RelationServiceImpl implements RelationService {
                           String tsField,
                           Long cursor) {
         for (Map<String, Object> r : rows.values()) {
+            // idObj: 目标字段
             Object idObj = r.get(idField);
+            // tsObj: 分数字段, 默认是createdAt, 即按关注顺序排序
             Object tsObj = r.get(tsField);
             if (idObj == null || tsObj == null) continue;
+            // 统一转为毫秒值
             long score = tsScore(tsObj);
+            // 写入Redis
             if (cursor == null || score <= cursor) {
                 redis.opsForZSet().add(key, String.valueOf(idObj), score);
             }

@@ -2,6 +2,8 @@ package com.tongji.relation.api;
 
 import com.tongji.relation.service.RelationService;
 import com.tongji.auth.token.JwtService;
+import com.tongji.counter.schema.UserCounterKeys;
+import com.tongji.counter.schema.UserCounterSchema;
 import com.tongji.profile.api.dto.ProfileResponse;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -9,11 +11,10 @@ import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.*;
 
+import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.function.IntFunction;
-import java.nio.charset.StandardCharsets;
 
 /**
  * 关系接口控制器。
@@ -109,31 +110,33 @@ public class RelationController {
 
     /**
      * 获取用户维度计数（SDS）。
-     * 结构与一致性：SDS 由 5 个 4 字节段组成（关注/粉丝/发文/获赞/获藏），按需触发采样校验与重建，保证接口稳定可用。
+     * 结构与一致性：SDS 由 5 个 4 字节段组成（关注/粉丝/发文/获赞/获藏），槽位定义见 UserCounterSchema；
+     * 按需触发采样校验与重建，保证接口稳定可用。
      * @param userId 用户ID
      * @return 各计数指标的值
      */
     @GetMapping("/counter")
     public Map<String, Long> counter(@RequestParam("userId") long userId) {
         // 从 Redis 读取用户计数字符串（SDS，键：ucnt:{userId}）
+        String sdsKey = UserCounterKeys.sdsKey(userId);
         byte[] raw = redis.execute((RedisCallback<byte[]>)
-                c -> c.stringCommands().get(("ucnt:" + userId).getBytes(StandardCharsets.UTF_8)));
+                c -> c.stringCommands().get(sdsKey.getBytes(StandardCharsets.UTF_8)));
 
         // 拼接计数结果
         Map<String, Long> m = new LinkedHashMap<>();
 
         // 缺失或结构异常（少于 5 段 × 每段 4 字节）时尝试重建
-        if (raw == null || raw.length < 20) {
+        if (raw == null || raw.length < UserCounterSchema.SCHEMA_LEN * UserCounterSchema.FIELD_SIZE) {
             try {
                 userCounterService.rebuildAllCounters(userId);
             } catch (Exception ignored) {}
 
             // 重建后二次读取
             raw = redis.execute((RedisCallback<byte[]>)
-                    c -> c.stringCommands().get(("ucnt:" + userId).getBytes(StandardCharsets.UTF_8)));
+                    c -> c.stringCommands().get(sdsKey.getBytes(StandardCharsets.UTF_8)));
 
             // 仍失败则返回 0，保证接口可用性
-            if (raw == null || raw.length < 20) {
+            if (raw == null || raw.length < UserCounterSchema.SCHEMA_LEN * UserCounterSchema.FIELD_SIZE) {
                 m.put("followings", 0L);
                 m.put("followers", 0L);
                 m.put("posts", 0L);
@@ -144,22 +147,12 @@ public class RelationController {
         }
 
         final byte[] buf = raw;
-        // 段数（每段 4 字节，按大端 32 位整型编码）
-        final int seg = buf.length / 4;
+        // 实际段数（每段 4 字节），用于发现 SDS 被写坏的场景
+        final int seg = buf.length / UserCounterSchema.FIELD_SIZE;
 
-        // 读取第 idx 段的计数（1 基坐标），大端拼接为 long
-        IntFunction<Long> read = idx -> {
-            if (idx < 1 || idx > seg) return 0L;
-            int off = (idx - 1) * 4;
-            long n = 0;
-            for (int i = 0; i < 4; i++) {
-                n = (n << 8) | (buf[off + i] & 0xFFL);
-            }
-            return n;
-        };
-
-        long sdsFollowings = read.apply(1);
-        long sdsFollowers = read.apply(2);
+        // 0 基槽位读取，越界返回 0
+        long sdsFollowings = UserCounterSchema.read32be(buf, UserCounterSchema.IDX_FOLLOWINGS);
+        long sdsFollowers = UserCounterSchema.read32be(buf, UserCounterSchema.IDX_FOLLOWERS);
 
         String chkKey = "ucnt:chk:" + userId;
         // 采样校验：使用 Redis 锁限流，每用户 300s 触发一次
@@ -178,30 +171,20 @@ public class RelationController {
             } catch (Exception ignored) {}
 
             // 段数异常或值不一致则触发全量重建
-            if ((seg != 5) || sdsFollowings != (long) dbFollowings || sdsFollowers != (long) dbFollowers) {
+            if ((seg != UserCounterSchema.SCHEMA_LEN) || sdsFollowings != (long) dbFollowings || sdsFollowers != (long) dbFollowers) {
                 try {
                     userCounterService.rebuildAllCounters(userId);
                 } catch (Exception ignored) {}
 
                 // 重建后读取并直接返回最新值
                 byte[] raw2 = redis.execute((RedisCallback<byte[]>)
-                        c -> c.stringCommands().get(("ucnt:" + userId).getBytes(StandardCharsets.UTF_8)));
-                if (raw2 != null && raw2.length >= 20) {
-                    final byte[] buf2 = raw2;
-                    // 二次读取函数：同样按大端 32 位读取
-                    IntFunction<Long> r2 = idx -> {
-                        int off = (idx - 1) * 4;
-                        long n = 0;
-                        for (int i = 0; i < 4; i++) {
-                            n = (n << 8) | (buf2[off + i] & 0xFFL);
-                        }
-                        return n;
-                    };
-                    m.put("followings", r2.apply(1));
-                    m.put("followers", r2.apply(2));
-                    m.put("posts", r2.apply(3));
-                    m.put("likedPosts", r2.apply(4));
-                    m.put("favedPosts", r2.apply(5));
+                        c -> c.stringCommands().get(sdsKey.getBytes(StandardCharsets.UTF_8)));
+                if (raw2 != null && raw2.length >= UserCounterSchema.SCHEMA_LEN * UserCounterSchema.FIELD_SIZE) {
+                    m.put("followings", UserCounterSchema.read32be(raw2, UserCounterSchema.IDX_FOLLOWINGS));
+                    m.put("followers", UserCounterSchema.read32be(raw2, UserCounterSchema.IDX_FOLLOWERS));
+                    m.put("posts", UserCounterSchema.read32be(raw2, UserCounterSchema.IDX_POSTS));
+                    m.put("likedPosts", UserCounterSchema.read32be(raw2, UserCounterSchema.IDX_LIKES_RECEIVED));
+                    m.put("favedPosts", UserCounterSchema.read32be(raw2, UserCounterSchema.IDX_FAVS_RECEIVED));
                     return m;
                 }
             }
@@ -210,9 +193,9 @@ public class RelationController {
         // 正常路径：直接返回 SDS 中的计数值
         m.put("followings", sdsFollowings);
         m.put("followers", sdsFollowers);
-        m.put("posts", read.apply(3));
-        m.put("likedPosts", read.apply(4));
-        m.put("favedPosts", read.apply(5));
+        m.put("posts", UserCounterSchema.read32be(buf, UserCounterSchema.IDX_POSTS));
+        m.put("likedPosts", UserCounterSchema.read32be(buf, UserCounterSchema.IDX_LIKES_RECEIVED));
+        m.put("favedPosts", UserCounterSchema.read32be(buf, UserCounterSchema.IDX_FAVS_RECEIVED));
         return m;
     }
 }

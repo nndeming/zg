@@ -1,6 +1,7 @@
 package com.tongji.counter.service.impl;
 
 import com.tongji.counter.schema.UserCounterKeys;
+import com.tongji.counter.schema.UserCounterSchema;
 import com.tongji.counter.service.CounterService;
 import com.tongji.counter.service.UserCounterService;
 import com.tongji.knowpost.mapper.KnowPostMapper;
@@ -11,8 +12,6 @@ import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -43,43 +42,48 @@ public class UserCounterServiceImpl implements UserCounterService {
         this.relationMapper = relationMapper;
         this.incrScript = new DefaultRedisScript<>();
         this.incrScript.setResultType(Long.class);
-        // 用户维度计数原子折叠（1 基坐标）
+        // 用户维度计数原子折叠（0 基坐标，槽位定义见 UserCounterSchema）
         this.incrScript.setScriptText(INCR_FIELD_LUA);
     }
 
     /** 增量更新关注数 */
     @Override
     public void incrementFollowings(long userId, int delta) {
-        String key = UserCounterKeys.sdsKey(userId);
-        redis.execute(incrScript, List.of(key), "5", "4", "1", String.valueOf(delta));
+        incr(UserCounterSchema.IDX_FOLLOWINGS, userId, delta);
     }
 
     /** 增量更新粉丝数 */
     @Override
     public void incrementFollowers(long userId, int delta) {
-        String key = UserCounterKeys.sdsKey(userId);
-        redis.execute(incrScript, List.of(key), "5", "4", "2", String.valueOf(delta));
+        incr(UserCounterSchema.IDX_FOLLOWERS, userId, delta);
     }
 
     /** 增量更新发文数 */
     @Override
     public void incrementPosts(long userId, int delta) {
-        String key = UserCounterKeys.sdsKey(userId);
-        redis.execute(incrScript, List.of(key), "5", "4", "3", String.valueOf(delta));
+        incr(UserCounterSchema.IDX_POSTS, userId, delta);
     }
 
     /** 增量更新获赞数（作者维度） */
     @Override
     public void incrementLikesReceived(long userId, int delta) {
-        String key = UserCounterKeys.sdsKey(userId);
-        redis.execute(incrScript, List.of(key), "5", "4", "4", String.valueOf(delta));
+        incr(UserCounterSchema.IDX_LIKES_RECEIVED, userId, delta);
     }
 
     /** 增量更新获收藏数（作者维度） */
     @Override
     public void incrementFavsReceived(long userId, int delta) {
+        incr(UserCounterSchema.IDX_FAVS_RECEIVED, userId, delta);
+    }
+
+    /** 按 0 基槽位下标对 SDS 对应字段做原子增减 */
+    private void incr(int idx, long userId, int delta) {
         String key = UserCounterKeys.sdsKey(userId);
-        redis.execute(incrScript, List.of(key), "5", "4", "5", String.valueOf(delta));
+        redis.execute(incrScript, List.of(key),
+                String.valueOf(UserCounterSchema.SCHEMA_LEN),
+                String.valueOf(UserCounterSchema.FIELD_SIZE),
+                String.valueOf(idx),
+                String.valueOf(delta));
     }
 
     /** 基于事实重建全部用户维度计数 */
@@ -87,7 +91,7 @@ public class UserCounterServiceImpl implements UserCounterService {
     public void rebuildAllCounters(long userId) {
         String key = UserCounterKeys.sdsKey(userId);
         byte[] raw = redis.execute((RedisCallback<byte[]>) c -> c.stringCommands().get(key.getBytes(StandardCharsets.UTF_8)));
-        int len = 5 * 4;
+        int len = UserCounterSchema.SCHEMA_LEN * UserCounterSchema.FIELD_SIZE;
         byte[] buf = new byte[len];
         if (raw != null && raw.length == len) {
             // 保留已存在的值，按需覆盖
@@ -114,16 +118,16 @@ public class UserCounterServiceImpl implements UserCounterService {
                 likeSum += v.getOrDefault("like", 0L);
                 favSum += v.getOrDefault("fav", 0L);
             }
-            write32be(buf, 2 * 4, posts);
-            write32be(buf, 3 * 4, likeSum);
-            write32be(buf, 4 * 4, favSum);
+            write32be(buf, UserCounterSchema.IDX_POSTS * UserCounterSchema.FIELD_SIZE, posts);
+            write32be(buf, UserCounterSchema.IDX_LIKES_RECEIVED * UserCounterSchema.FIELD_SIZE, likeSum);
+            write32be(buf, UserCounterSchema.IDX_FAVS_RECEIVED * UserCounterSchema.FIELD_SIZE, favSum);
         } else {
-            write32be(buf, 2 * 4, 0L);
-            write32be(buf, 3 * 4, 0L);
-            write32be(buf, 4 * 4, 0L);
+            write32be(buf, UserCounterSchema.IDX_POSTS * UserCounterSchema.FIELD_SIZE, 0L);
+            write32be(buf, UserCounterSchema.IDX_LIKES_RECEIVED * UserCounterSchema.FIELD_SIZE, 0L);
+            write32be(buf, UserCounterSchema.IDX_FAVS_RECEIVED * UserCounterSchema.FIELD_SIZE, 0L);
         }
-        write32be(buf, 0, followings);
-        write32be(buf, 4, followers);
+        write32be(buf, UserCounterSchema.IDX_FOLLOWINGS * UserCounterSchema.FIELD_SIZE, followings);
+        write32be(buf, UserCounterSchema.IDX_FOLLOWERS * UserCounterSchema.FIELD_SIZE, followers);
 
         // 回写用户计数 SDS
         redis.execute((RedisCallback<Void>) c -> {
@@ -136,7 +140,7 @@ public class UserCounterServiceImpl implements UserCounterService {
             
             local cntKey = KEYS[1]
             local schemaLen = tonumber(ARGV[1])
-            local fieldSize = tonumber(ARGV[2])
+            local fieldSize = tonumber(ARGV[2]) -- 固定为4
             local idx = tonumber(ARGV[3])
             local delta = tonumber(ARGV[4])
             local function read32be(s, off)
@@ -152,7 +156,7 @@ public class UserCounterServiceImpl implements UserCounterService {
             end
             local cnt = redis.call('GET', cntKey)
             if not cnt then cnt = string.rep(string.char(0), schemaLen * fieldSize) end
-            local off = (idx - 1) * fieldSize
+            local off = idx * fieldSize -- 0 基坐标：偏移 = 下标 × 4
             local v = read32be(cnt, off) + delta
             if v < 0 then v = 0 end
             local seg = write32be(v)
@@ -176,4 +180,3 @@ public class UserCounterServiceImpl implements UserCounterService {
         buf[off + 3] = (byte) (n & 0xFF);
     }
 }
-
