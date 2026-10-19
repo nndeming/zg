@@ -28,7 +28,11 @@ public class RagQueryService {
     private final RagIndexService indexService;
 
     /**
-     * 使用 WebFlux 返回回答内容的流。
+     * 使用 WebFlux 返回回答内容的流
+     * @param postId 知文ID
+     * @param question 用户的问题
+     * @param topK 最终喂给模型的上下文切片条数
+     * @param maxTokens 模型回答的最大输出长度
      */
     public Flux<String> streamAnswerFlux(long postId, String question, int topK, int maxTokens) {
         // 轻量保障：如索引不存在或指纹未变更则跳过，否则重建
@@ -64,12 +68,14 @@ public class RagQueryService {
      */
     private List<String> searchContexts(String postId, String query, int topK) {
         int fetchK = Math.max(topK * 3, 20); // 宽召回：扩大初始检索集合
+        // 使用用户的query与向量库做语义相似度匹配
         List<Document> docs = vectorStore.similaritySearch(
                 SearchRequest.builder().query(query).topK(fetchK).build() // 语义相似检索
         );
         List<String> out = new ArrayList<>(topK);
         for (Document d : docs) {
             Object pid = d.getMetadata().get("postId");
+            // 避免跨帖子污染
             if (pid != null && postId.equals(String.valueOf(pid))) { // 仅保留当前帖子对应的切片
                 String txt = d.getText();
                 if (txt != null && !txt.isEmpty()) {

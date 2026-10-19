@@ -44,6 +44,7 @@ public class RagIndexService {
     }
 
     public int reindexSinglePost(long postId) {
+        // 查询知文详细信息
         KnowPostDetailRow row = knowPostMapper.findDetailById(postId);
         if (row == null) {
             log.warn("Post {} not found", postId);
@@ -114,6 +115,7 @@ public class RagIndexService {
      */
     private boolean isUpToDate(long postId, String currentSha, String currentEtag) {
         try {
+            // 注意这是ES中的向量索引, 和文章可搜态使用的索引不一样
             if (!StringUtils.hasText(esProps.getIndex())) {
                 // 未配置索引名则无法判断，直接视为需要重建
                 return false;
@@ -123,15 +125,23 @@ public class RagIndexService {
                             .size(1)
                             .query(q -> q.term(t -> t
                                     .field("metadata.postId")
+                                    // 根据postId检索
                                     .value(v -> v.stringValue(String.valueOf(postId))))),
                     Map.class);
+            // 两层 hits() 对应 ES 响应 JSON 的两层结构：
+            // 外层 "hits" 对象（总命中数、maxScore 等元信息，即 HitsMetadata）
+            //   └─ 内层 "hits" 数组（真正的命中文档列表，即 List<Hit>）
             List<Hit<Map>> hits = resp.hits().hits();
             if (hits == null || hits.isEmpty()) return false;
+            // _source 即写入时的文档内容（text + metadata）
             Map source = hits.getFirst().source();
             if (source == null) return false;
+            // metadata 在建索引时统一写入，同一篇文章的所有切片指纹相同，故任取一条即可代表全篇
             Object metaObj = source.get("metadata");
             if (!(metaObj instanceof Map<?, ?> meta)) return false;
+            // 获取Sha256存档
             String indexedSha = asString(meta.get("contentSha256"));
+            // 获取Etag存档
             String indexedEtag = asString(meta.get("contentEtag"));
             if (StringUtils.hasText(currentSha) && StringUtils.hasText(indexedSha)) {
                 return Objects.equals(currentSha, indexedSha);
@@ -184,6 +194,7 @@ public class RagIndexService {
      */
     private List<String> chunkMarkdown(String text) {
         List<String> paras = new ArrayList<>();
+        // 根据换行符做区分, windows中换行是\r\n组合, 而linux中是\n
         String[] lines = text.split("\r?\n");
         StringBuilder buf = new StringBuilder();
         for (String line : lines) {

@@ -49,9 +49,9 @@ public class KnowPostDescriptionServiceImpl implements KnowPostDescriptionServic
             return "";
         }
         String t = Normalizer.normalize(text, Normalizer.Form.NFKC)
-                .replaceAll("\r\n|\r|\n", " ")
-                .replaceAll("\\s+", " ")
-                .trim();
+                .replaceAll("\r\n|\r|\n", " ")  // 把 \r\n/\r/\n 统一换成空格
+                .replaceAll("\\s+", " ")    // 多个空格压成一个空格
+                .trim();    // 去掉首尾空格
 
         // 去掉可能的前后引号或多余标点
         t = t.replaceAll("^[\"'“”‘’]+|[\"'“”‘’]+$", "")
