@@ -53,6 +53,7 @@ public class CanalOutboxConsumerSearch {
                 if ("delete".equalsIgnoreCase(op)) {
                     indexService.softDeleteKnowPost(id);
                 } else {
+                    // upsert情况
                     indexService.upsertKnowPost(id);
                 }
             }

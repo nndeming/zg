@@ -78,11 +78,14 @@ public class SearchIndexService {
      */
     public void upsertKnowPost(long id) {
         try {
+            // 查找文章信息
             KnowPostDetailRow row = knowPostMapper.findDetailById(id);
             if (row == null) {
                 log.warn("Index upsert skipped: post {} not found", id);
                 return;
             }
+
+            // 构造要放入es的doc信息
             Map<String, Object> doc = new HashMap<>();
             doc.put("content_id", row.getId());
             doc.put("content_type", row.getType());
@@ -121,12 +124,14 @@ public class SearchIndexService {
             }
 
             // 刷新策略：wait_for，保证写入后即刻可检索
+            // Es的写入分两步, 先写进内存buffer(此时搜不到), 再通过refresh刷成segment(可检索)
             IndexRequest<Map<String, Object>> req = IndexRequest.of(b -> b
-                    .index(INDEX)
-                    .id(String.valueOf(id))
-                    .document(doc)
-                    .refresh(Refresh.WaitFor)
+                    .index(INDEX)   // 目标索引名, 类比关系型数据库中的数据表
+                    .id(String.valueOf(id))     // 文档id
+                    .document(doc)              // 文档主体
+                    .refresh(Refresh.WaitFor)   // 等下一次刷新
             );
+            // id不存在 -> 新建文档; id存在 -> 整个覆盖
             IndexResponse resp = es.index(req);
             log.info("Indexed post {} result={} version={}", id, resp.result(), resp.version());
         } catch (Exception e) {
