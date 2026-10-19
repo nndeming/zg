@@ -20,10 +20,27 @@ public interface KnowPostService {
 
     void updateMetadata(long creatorId, long id, String title, Long tagId, List<String> tags, List<String> imgUrls, String visible, Boolean isTop, String description);
 
+    /**
+     * 发布知文
+     * @param creatorId 创建者ID
+     * @param id 文章ID
+     */
     void publish(long creatorId, long id);
 
+    /**
+     * 设置置顶状态
+     * @param creatorId 创建者ID
+     * @param id 文章ID
+     * @param isTop 是否置顶
+     */
     void updateTop(long creatorId, long id, boolean isTop);
 
+    /**
+     * 设置可见性(权限)
+     * @param creatorId 创建者ID
+     * @param id 文章ID
+     * @param visible 可见性
+     */
     void updateVisibility(long creatorId, long id, String visible);
 
     void delete(long creatorId, long id);

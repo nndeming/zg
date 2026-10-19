@@ -210,6 +210,7 @@ public class KnowPostServiceImpl implements KnowPostService {
 
         // 写入 Outbox 事件，驱动搜索索引增量更新
         try {
+            // 此处写入outbox后, 会根据canal转为kafka消息, 最后在search/outbox中被消费
             long outId = idGen.nextId();
             String payload = objectMapper.writeValueAsString(Map.of("entity", "knowpost", "op", "upsert", "id", id));
             outboxMapper.insert(outId, "knowpost", id, "KnowPostPublished", payload);
@@ -558,24 +559,24 @@ public class KnowPostServiceImpl implements KnowPostService {
      * 1. 详情页整页缓存 (knowpost:detail:{id})
      * 2. Feed 流内容片段缓存 (feed:item:{id})
      * 这样可以确保热点内容在 Feed 流中也不会轻易过期，避免 Feed 流回源。
-     * @param id 内容 ID
-     * @param detailPageKey 详情页缓存 Key
+     * @param id 知文文章 ID
+     * @param detailPageKey 详情页缓存 Key（knowpost:detail:{id}:v{版本}）
      */
     private void recordHotKeyAndExtendTtl(long id, String detailPageKey) {
-        // 统一使用 knowpost:{id} 作为热度统计 Key
+        // 热度统计专用 Key：与 feed 侧共享同一份热度计数（knowpost:{知文ID}）
         String hotKeyId = "knowpost:" + id;
         hotKey.record(hotKeyId);
-        
+
         int baseTtl = 60;
         int target = hotKey.ttlForPublic(baseTtl, hotKeyId);
-        
-        // 1. 延长详情页缓存
+
+        // 1. 延长详情页整页缓存
         Long detailTtl = redis.getExpire(detailPageKey);
         if (detailTtl < target) {
             redis.expire(detailPageKey, java.time.Duration.ofSeconds(target));
         }
-        
-        // 2. 延长 Feed 流内容片段缓存
+
+        // 2. 延长 Feed 流内容片段缓存（feed:item:{知文ID}）
         String itemKey = "feed:item:" + id;
         Long itemTtl = redis.getExpire(itemKey);
         if (itemTtl < target) {
